@@ -933,6 +933,8 @@ class AsyncNemoGymRolloutImpl:
     batched through a single NeMo-Gym run_rollouts call.
     """
 
+    _forest_training: bool = False
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -1025,10 +1027,22 @@ class AsyncNemoGymRolloutImpl:
         )
         if not receipt_mode:
             source_message_log = input_sample["message_log"]
-            attach_static_multimodal_payload(prompt_message_log, source_message_log)
+            # Prompt and completion logs may alias message dictionaries. Share
+            # one identity set so rollout-matched media cannot be overwritten
+            # through a second view after its marker is consumed.
+            processed_target_ids: set[int] = set()
+            attach_static_multimodal_payload(
+                prompt_message_log,
+                source_message_log,
+                processed_target_ids=processed_target_ids,
+                tokenizer=self._tokenizer,
+            )
             for completion in completions:
                 attach_static_multimodal_payload(
-                    completion.message_log, source_message_log
+                    completion.message_log,
+                    source_message_log,
+                    processed_target_ids=processed_target_ids,
+                    tokenizer=self._tokenizer,
                 )
 
         timer.stop(f"{timer_prefix}/total")

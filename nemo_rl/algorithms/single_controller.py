@@ -97,6 +97,8 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
+    _save_adaptive_loss_state,
+    _update_adaptive_loss_state,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
 )
@@ -148,6 +150,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     KVBatchMeta,
@@ -156,6 +159,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     is_metrics_client,
     log_step_metrics,
@@ -226,6 +230,12 @@ from nemo_rl.utils.logger import (
     should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import (
+    is_msc_path,
+    load_checkpoint_object,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -534,6 +544,7 @@ class SingleControllerActor:
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
         self._finalizer_actors = list(actor_args.finalizer_actors)
+        self._storage_units = tuple(actor_args.storage_units)
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:
             self._available_finalizers.put_nowait(actor)
@@ -631,7 +642,15 @@ class SingleControllerActor:
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
         )
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
-        if restored_dispatch_index is None:
+        # The saved dispatch index counts groups dispatched ahead of training, which
+        # only a data-plane snapshot can give back. Without one (e.g. msc://), those
+        # groups are gone, so counting them as dispatched would stall the resume.
+        buffered_groups_not_restored = (
+            self._sampler.supports_buffer_checkpoint
+            and actor_args.last_checkpoint_path is not None
+            and data_plane_checkpoint_metadata is None
+        )
+        if restored_dispatch_index is None or buffered_groups_not_restored:
             # Checkpoints predating exact sampler state reconstruct the original
             # fresh-step invariant from the restored trainer version.
             self._sampler.set_dispatch_index(restored_trainer_version)
@@ -641,6 +660,9 @@ class SingleControllerActor:
             self._master_config.checkpointing["enabled"]
             and self._sampler.supports_buffer_checkpoint
             and not self._master_config.checkpointing.get("save_data_plane")
+            # msc:// cannot hold data-plane snapshots; setup warns that buffered
+            # rollouts are then discarded on resume.
+            and not is_msc_path(self._master_config.checkpointing["checkpoint_dir"])
         ):
             raise ValueError(
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -925,6 +947,7 @@ class SingleControllerActor:
                     ray.kill(actor, no_restart=True)
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
+            await stop_storage_units(self._storage_units)
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
@@ -1729,7 +1752,7 @@ class SingleControllerActor:
             self._last_checkpoint_path, REPLACEMENT_RESERVE_FILENAME
         )
         # New checkpoints write even an empty reserve; legacy absence remains valid.
-        if not os.path.exists(reserve_path):
+        if not path_exists(reserve_path):
             if (self._data_plane_checkpoint_metadata or {}).get(
                 "rollout_recovery_schema_version", 0
             ) >= 4:
@@ -1738,7 +1761,7 @@ class SingleControllerActor:
         # weights_only=False: spares are pickled DatumSpecs, and the checkpoint is a
         # trusted same-job artifact (the replay buffer restore loads on the same terms).
         reserve_state = await asyncio.to_thread(
-            torch.load, reserve_path, weights_only=False
+            load_checkpoint_object, reserve_path, weights_only=False
         )
         self._replacement_reserve.extend(reserve_state)
         print(
@@ -1932,11 +1955,11 @@ class SingleControllerActor:
         """Finalize and index one group atomically with respect to TQ saves.
 
         Returns the committed FinalizedGroup once the group is committed to
-        the replay buffer (callers may read valid_row_count/total_row_count
-        off it to decide whether the group is worth keeping), or None when
+        the replay buffer (callers use logical-owner counts for forests, or row
+        counts for ordinary capture, to decide whether to keep it), or None when
         the finalizer itself dropped it as a structural outcome (ownership
         already cleaned up; the caller credits the step short). A low
-        valid-row fraction is no longer a finalizer-side drop -- the caller
+        valid-rollout fraction is no longer a finalizer-side drop -- the caller
         decides that, since only the caller can source a replacement.
         """
         self._finalizer_waiters += 1
@@ -2278,19 +2301,35 @@ class SingleControllerActor:
                                 self._credit_shortfall(target_step)
                                 return
                             min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
-                            below_threshold = (
-                                min_valid_fraction is not None
-                                and finalized.total_row_count > 0
-                                and finalized.valid_row_count
-                                / finalized.total_row_count
-                                < min_valid_fraction
-                            )
+                            valid_count = total_count = 0
+                            below_threshold = False
+                            if min_valid_fraction is not None:
+                                if self._master_config.token_capture.forest_training:
+                                    # Compaction expands owners into unequal row
+                                    # counts; use the finalizer's owner totals.
+                                    valid_count = int(
+                                        finalized.metrics[
+                                            "finalize/valid_logical_owner_count"
+                                        ]
+                                    )
+                                    total_count = int(
+                                        finalized.metrics[
+                                            "finalize/logical_owner_count"
+                                        ]
+                                    )
+                                else:
+                                    valid_count = finalized.valid_row_count
+                                    total_count = finalized.total_row_count
+                                below_threshold = (
+                                    total_count > 0
+                                    and valid_count / total_count < min_valid_fraction
+                                )
                             if not below_threshold:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
+                            # Publication succeeded, but too few rollouts verified
+                            # to be worth training on. Unlike the finalizer's own
                             # structural drops above, this is a policy call
                             # only the controller can act on: it is the one
                             # component that can source a replacement.
@@ -2306,8 +2345,7 @@ class SingleControllerActor:
                             print(
                                 f"  finalize: group {request.group_id} below "
                                 "min_valid_fraction_per_group "
-                                f"({finalized.valid_row_count}/"
-                                f"{finalized.total_row_count} < "
+                                f"({valid_count}/{total_count} < "
                                 f"{min_valid_fraction}); seeking a replacement",
                                 flush=True,
                             )
@@ -3658,6 +3696,7 @@ class SingleControllerActor:
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
+                    _update_adaptive_loss_state(self._loss_fn, step_metrics)
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
                 async with self._data_plane_checkpoint_barrier.mutation(
@@ -5276,6 +5315,7 @@ class SingleControllerActor:
             save_state.current_epoch = self._current_epoch
             save_state.consumed_samples = self._consumed_samples
             save_state.total_valid_tokens = self._total_valid_tokens
+            _save_adaptive_loss_state(save_state, self._loss_fn)
             save_state.sampler_name = self._async_cfg.sampler.name
             save_state.sampler_dispatch_index = self._sampler.dispatch_index
             dataloader_state = self._dataloader.state_dict()
@@ -5395,18 +5435,16 @@ class SingleControllerActor:
         )
 
         await asyncio.to_thread(
-            torch.save,
-            dataloader_state,
-            os.path.join(checkpoint_path, "train_dataloader.pt"),
+            save_dataloader_state, dataloader_state, checkpoint_path
         )
         await asyncio.to_thread(
-            torch.save,
+            save_checkpoint_object,
             reserve_state,
             os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
         )
         if replay_metadata is not None:
             await asyncio.to_thread(
-                torch.save,
+                save_checkpoint_object,
                 replay_metadata,
                 os.path.join(checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
             )

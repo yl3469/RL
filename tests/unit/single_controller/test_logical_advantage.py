@@ -15,6 +15,7 @@
 """Exercise logical-owner GRPO through the actual SingleController stage."""
 
 import asyncio
+import math
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -171,6 +172,7 @@ def _controller(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=False,
         teacher_logprobs_required=False,
+        opd_full_enabled=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
         train_data_dump_dir=None,
@@ -226,6 +228,86 @@ def test_logprob_error_masks_whole_owner(
         torch.testing.assert_close(data["advantages"][row], torch.full((3,), expected))
     assert valid == bool(retained)
     assert ctrl._step_log_dict["reward_partials"][0].weight == len(retained)
+
+
+@pytest.mark.parametrize("lengths", [(100,), (99, 1), (40, 40, 20), (20,) * 5])
+@pytest.mark.parametrize("reorder", [False, True])
+def test_logprob_filtering_pools_owned_tokens_independently_of_segmentation(
+    lengths: tuple[int, ...], reorder: bool
+) -> None:
+    meta, data = _batch(
+        [("a", [(0.0, len(lengths)), (1.0, 2), (3.0, 1)])], padding=True
+    )
+    width = max(lengths) + 2
+    counts = [*lengths, 1, 1, 1, 0]
+    data["token_mask"] = torch.zeros(len(counts), width)
+    data["prev_logprobs"] = torch.zeros(len(counts), width)
+    data["generation_logprobs"] = torch.zeros(len(counts), width)
+    for row, count in enumerate(counts):
+        data["token_mask"][row, 2 : count + 2] = 1
+    # Prompts/replayed prefixes and a borrowed padding layout cannot add error.
+    data["generation_logprobs"][:, :2] = -1000
+    data["generation_logprobs"][-1] = torch.nan
+    data["token_mask"][-1] = 1
+    # Owner 0: 99 matching tokens and one 1.2-error token, pooled mean 1.002.
+    data["generation_logprobs"][len(lengths) - 1, lengths[-1] + 1] = -math.log(1.2)
+    # Owner 1: pooled mean 1.1; both of its rows must be filtered.
+    data["generation_logprobs"][len(lengths), 2] = -math.log(1.2)
+    if reorder:
+        order = list(reversed(range(len(counts))))
+        meta, data = meta.subset(order), data[order]
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={"seq_logprob_error_threshold": 1.05},
+        policy_logprobs_required=True,
+    )
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    for row, tag in enumerate(meta.tags):
+        slot = tag["logical_slot"]
+        keep = slot in (0, 2)
+        assert data["sample_mask"][row].item() == float(keep)
+        expected = {0: -1.5, 2: 1.5}.get(slot, 0.0)
+        torch.testing.assert_close(
+            data["advantages"][row], torch.full((width,), expected)
+        )
+    metrics = ctrl._step_log_dict["seq_logprob_error_metrics"][0]
+    assert metrics["num_masked_seqs_by_logprob_error"] == 2
+    assert math.isfinite(metrics["max_seq_mult_prob_error"])
+    if lengths == (99, 1):
+        # Diagnostics retain the short segment's error even though its owner passes.
+        assert metrics["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.2)
+    assert ctrl._step_log_dict["reward_partials"][0].weight == 2
+
+
+@pytest.mark.parametrize("empty_rows", [[0], [1], [0, 1]])
+@pytest.mark.parametrize("policy_logprobs_required", [False, True])
+def test_tokenless_segments_do_not_remove_an_owner_with_training_tokens(
+    empty_rows: list[int], policy_logprobs_required: bool
+) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])], padding=True)
+    data["token_mask"][empty_rows] = 0
+    data["prev_logprobs"] = torch.zeros(5, 3)
+    data["generation_logprobs"] = torch.zeros(5, 3)
+    ctrl = _controller(meta, data, policy_logprobs_required=policy_logprobs_required)
+    keep_owner_zero = len(empty_rows) < 2
+    baseline = 4 / 3 if keep_owner_zero else 2.0
+    for _ in range(2):
+        # Reusing already filtered physical rows must preserve logical validity.
+        _, valid = asyncio.run(ctrl._advantage_stage(meta))
+        assert valid
+        for row, tag in enumerate(meta.tags):
+            slot = tag["logical_slot"]
+            keep = slot is not None and row not in empty_rows
+            assert data["sample_mask"][row].item() == float(keep)
+            expected = ([0.0, 1.0, 3.0][slot] - baseline) if keep else 0.0
+            torch.testing.assert_close(
+                data["advantages"][row], torch.full((3,), expected)
+            )
+        assert ctrl._step_log_dict["reward_partials"][-1].weight == (
+            3 if keep_owner_zero else 2
+        )
 
 
 @pytest.mark.parametrize("bounds", [(-0.2, 0.3), (0.2, 0.4), (-0.4, -0.2)])
