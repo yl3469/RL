@@ -31,20 +31,17 @@ Used by both :mod:`token_aligner` and
   :func:`get_sparse_projection_matrix` / :func:`get_topk_projection`
   process-local caches, :func:`slice_sparse_projection_rows`, and
   :func:`build_exact_token_map` (cached common/uncommon partition).
-- :func:`alignment_from_flat_batch` rehydrates the flat ``alignment_*``
-  data-dict keys into an :class:`AlignmentBatch`.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
@@ -56,17 +53,6 @@ from nemo_rl.distributed.model_utils import (
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
-    )
-
-
-def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
-    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys.
-
-    The field set is driven off :class:`AlignmentBatch` so the helper
-    can't drift from the schema.
-    """
-    return AlignmentBatch(
-        **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
     )
 
 
@@ -353,19 +339,15 @@ def student_next_token_ce(
     logits: torch.Tensor,
     *,
     input_ids: torch.Tensor,
-    seq_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-token next-token cross-entropy ``[B, T-1]`` on the student.
 
-    DTensor (TP/CP) logits route through the vocab-parallel log-prob helper
-    (which also handles the CP roll); plain logits use a local shifted
-    ``cross_entropy``. The next-token shift (drop the last predictor) matches the
-    convention the KL terms use.
+    DTensor (TP) logits route through the vocab-parallel log-prob helper; plain
+    logits use a local shifted ``cross_entropy``. The next-token shift (drop the
+    last predictor) matches the convention the KL terms use.
     """
     if isinstance(logits, DTensor):
-        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
-            logits, input_ids, seq_index=seq_index
-        )
+        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(logits, input_ids)
         return -next_token_logprobs
     shift_logits = logits[:, :-1].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
@@ -1059,7 +1041,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 "context parallel size, but got "
                 f"sequence_length={full_student_seq_len}, cp_size={cp_size}. "
                 "Set policy.make_sequence_length_divisible_by to a multiple of "
-                "policy.dtensor_cfg.context_parallel_size."
+                "policy.automodel_cfg.context_parallel_size."
             )
         cp_rank = torch.distributed.get_rank(cp_group) if cp_group is not None else 0
         student_seq_len = full_student_seq_len // cp_size
