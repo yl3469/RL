@@ -202,6 +202,7 @@ on_policy_distillation:
     teacher_lm_head_lifecycle: offload  # none | offload | evict
     chunk_size: 1024
     validate_decomposition: false
+    log_student_entropy: false
 ```
 
 `teacher_payload` selects what crosses the teacher/student boundary:
@@ -242,6 +243,11 @@ default. The assertion that actually catches a broken payload, gather, LM-head
 shard, or token shift is the divergence itself staying near zero under
 self-distillation.
 
+`log_student_entropy` reports only the student's exact next-token entropy
+(`opd_full_entropy`), averaged over trained tokens. It needs no teacher
+logits, costs one extra chunked no-grad pass over the student logits, and is
+also available under [W2S-OPD](#weak-to-strong-opd-w2s-opd).
+
 ### Current restrictions
 
 Rejected at construction rather than silently ignored:
@@ -269,6 +275,101 @@ Rejected at construction rather than silently ignored:
 - The [TROPD](#trust-region-teacher-tropd) knobs only reshape `advantages`, which
   this loss ignores: `proximal_teacher_alpha < 1` and
   `subtract_global_baseline: true` are rejected.
+
+## Weak-to-strong OPD (W2S-OPD)
+
+`on_policy_distillation.w2s` implements weak-to-strong on-policy distillation
+([arXiv:2607.26246](https://arxiv.org/abs/2607.26246), equations 2 and 7).
+Three frozen models score every student-generated prefix: the *anchor*, a
+frozen copy of the student's initialization; the *positive* teacher, a post-RL
+checkpoint; and the *negative* teacher, its pre-RL checkpoint. Their logits
+define a proxy teacher
+
+```
+z_proxy = z_anchor + alpha · (z_positive − z_negative)
+```
+
+and the student minimizes the reverse KL to it, with both distributions
+renormalized on the proxy's exact top-K support `S_t = top-K(z_proxy,t)`:
+
+```
+L_t = Σ_{v ∈ S_t} p̃_student(v) · [ log p̃_student(v) − log p̃_proxy(v) ]
+```
+
+The support is selected after the logit arithmetic — the union of each model's
+own top-K is not equivalent — and padded vocabulary ids never enter it. Only the
+student receives gradients. Like full-vocabulary MOPD, this replaces the
+policy-gradient objective: rewards, advantages, and importance ratios do not
+enter the loss, and the OPD advantage estimator's output is unused.
+
+```yaml
+on_policy_distillation:
+  enabled: true
+  teacher_model_by_agent_name:
+    my_agent: /path/to/post-rl-teacher    # positive arm
+  reference_model_by_agent_name:
+    my_agent: /path/to/pre-rl-teacher     # negative arm
+  w2s:
+    enabled: true
+    anchor_model: ${policy.model_name}
+    alpha: 0.75
+    top_k: 32
+    transport: proxy_support  # or: hidden_states
+    chunk_size: 128
+    payload_dtype: bfloat16
+    teacher_lm_head_lifecycle: offload  # none | offload
+    log_student_entropy: false
+```
+
+Each reference becomes a frozen `ref:<alias>` teacher and the anchor an
+`anchor:` teacher. They are resourced like any other non-colocated teacher:
+`teacher_overrides` accepts the `ref:<alias>` and `anchor:` keys, and a
+`ref:<alias>` teacher falls back to the `<alias>` override. Roles that share a
+checkpoint share one teacher worker group.
+
+`transport` selects what crosses the teacher/student boundary:
+
+| | per token | notes |
+|---|---|---|
+| `proxy_support` (default) | `K` int32 ids + `K` float32 log-probabilities (256 B at `K=32`) | The anchor and positive teachers write their pre-LM-head hidden states to temporary data-plane rows. The negative teacher reads them, projects all three arms with the three frozen LM heads on its own GPUs, takes the exact global top-K across TP, gathers it across CP, and publishes the support (`w2s_proxy_support_ids`) and the renormalized proxy log-probabilities (`w2s_proxy_target_logprobs`). The temporary rows are cleared within the same enrichment, so no hidden state is retained until training. The student only gathers its own logits on the support. |
+| `hidden_states` | the three hidden sizes summed | Every arm writes its hidden states to its own column (`w2s_anchor_hidden_states`, `w2s_positive_hidden_states`, `w2s_negative_hidden_states`), and the student builds the proxy with the three frozen LM heads. A reference path; the payload stays in the data plane until training. |
+
+Both transports compute the same objective; the unit tests and the TP2×CP2
+checks in `tests/functional/w2s_opd_distributed.py` and
+`tests/functional/w2s_compact_distributed.py` compare them in value and
+gradient. The loss reports `w2s_opd_reverse_kl` (with `_min` and `_max`),
+`w2s_opd_entropy` under `log_student_entropy`, and three sampler-drift
+diagnostics computed from the generation and training log-probabilities:
+`w2s_opd_sampling_importance_ratio`, `w2s_opd_seq_mean_log_ratio_abs`, and
+`w2s_opd_seq_sum_log_ratio_abs`. None of the three enters the loss.
+
+### W2S-OPD restrictions
+
+On top of the full-vocabulary loss restrictions above (Megatron, the
+Single-Controller runtime, and no policy-gradient knobs), the following are
+rejected rather than silently ignored:
+
+- Exactly one positive and one negative checkpoint, with a
+  `reference_model_by_agent_name` entry for every teacher alias. The `ref:` and
+  `anchor:` aliases are reserved, and `deduplicate_shared_teacher_checkpoints`
+  must stay `true`.
+- `anchor_model` must equal `policy.model_name`, so a resumed student keeps
+  anchoring to its initialization.
+- All three frozen models must share the student's token-ID mapping; this is
+  checked when the teachers start.
+- Unfiltered, untempered sampling: `policy.generation.temperature: 1.0`,
+  `top_k: null`, and `top_p: 1.0`.
+- `loss_fn.reference_policy_kl_penalty: 0`; the anchor already ties the proxy
+  to the student's initialization.
+- `transport: proxy_support` needs `policy.sequence_packing.enabled: true` and a
+  negative teacher with `pipeline_model_parallel_size: 1`.
+- Under the `ready_first` sampler, set `grpo.seq_logprob_error_threshold`
+  instead of `use_importance_sampling_correction`: there is no sampled-token
+  term to reweight, so rollouts whose generation and training log-probabilities
+  drift too far apart are masked instead.
+- Every frozen model must produce its logits as `output_layer(h)`; the same
+  post-transform restriction as `teacher_payload: hidden_states` applies, and is
+  checked on each teacher's first scoring pass.
 
 ## Running MOPD
 

@@ -706,11 +706,19 @@ class OnPolicyDistillationFullTransport(TypedDict):
     chunk_size: int | None
     teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
     validate_decomposition: bool
+    log_student_entropy: bool
     payload_field: str
     # Per-sample teacher-identity column, routing each row's payload to the
     # right teacher LM-head shard. Only the hidden-state path needs it; the
     # logits payload ships an already-projected distribution, so it is None.
     teacher_index_field: str | None
+    # Present only for W2S-OPD (``W2SOPDConfig``), which rides this transport.
+    method: NotRequired[Literal["w2s_opd"]]
+    anchor_model: NotRequired[str]
+    alpha: NotRequired[float]
+    top_k: NotRequired[int]
+    vocab_size: NotRequired[int | None]
+    transport: NotRequired[Literal["proxy_support", "hidden_states"]]
 
 
 class PolicyConfig(TypedDict):

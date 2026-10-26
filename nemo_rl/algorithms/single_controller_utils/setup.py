@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Literal, Optional, cast
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -1084,6 +1084,52 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
+def _load_w2s_teacher_lm_heads(
+    trainer: Any,
+    teacher_worker_groups: dict[str, Any],
+    alias_to_group_alias: dict[str, str],
+    *,
+    positive_alias: str,
+    transport: Literal["proxy_support", "hidden_states"],
+) -> None:
+    """Load the frozen W2S-OPD anchor/positive/negative LM heads where the proxy is built.
+
+    ``proxy_support`` folds the proxy on the negative teacher, so its workers
+    load the heads and the student never holds one; ``hidden_states`` projects
+    the three arms on the student.
+
+    Args:
+        trainer: The driver-side policy whose workers hold the student model.
+        teacher_worker_groups: Deduplicated teacher groups, keyed by primary alias.
+        alias_to_group_alias: Routing alias to primary alias, including the
+            reserved ``anchor:`` and ``ref:<alias>`` entries.
+        positive_alias: The teacher alias whose checkpoint is the positive arm.
+        transport: ``on_policy_distillation.w2s.transport``.
+    """
+    routes = ("anchor:", positive_alias, f"ref:{positive_alias}")
+    teacher_path_configs = [
+        cast(PolicyConfig, teacher_worker_groups[alias_to_group_alias[route]].cfg)
+        for route in routes
+    ]
+    if transport == "proxy_support":
+        negative = teacher_worker_groups[alias_to_group_alias[routes[2]]]
+        paths = negative.load_w2s_teacher_lm_heads(teacher_path_configs)
+        where = f"negative teacher {negative.alias!r}"
+    else:
+        # Resolved on the student workers, as in _load_opd_full_teacher_lm_heads.
+        paths = ray.get(
+            trainer.worker_group.run_all_workers_single_data(
+                "load_w2s_teacher_lm_heads",
+                teacher_path_configs=teacher_path_configs,
+            )
+        )[0]
+        where = "student"
+    print(
+        f"  ✓ Loaded W2S-OPD anchor/positive/negative LM heads on the {where}: {paths}",
+        flush=True,
+    )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1408,7 +1454,21 @@ def setup_single_controller(
     # Resolved once here so the student workers and the teacher worker group
     # (which deep-copies this config) read the same settings. Absent means the
     # feature is off; workers must not re-derive a default.
-    opd_full_config = opd_module.get_opd_full_config(master_config)
+    opd_full_config = opd_module.get_opd_distribution_config(master_config)
+    if isinstance(opd_full_config, opd_module.W2SOPDConfig):
+        # The proxy ranks the shared tokenizer's ids only: padded LM-head rows
+        # past them must never enter its support.
+        vocab_size = len(tokenizer)
+        if opd_full_config.top_k > vocab_size:
+            raise ValueError(
+                f"on_policy_distillation.w2s.top_k ({opd_full_config.top_k}) "
+                f"exceeds the tokenizer vocabulary ({vocab_size})."
+            )
+        opd_full_config.vocab_size = vocab_size
+        # Every later resolution (loss, teacher coordinator) reads this block.
+        assert master_config.on_policy_distillation is not None
+        assert master_config.on_policy_distillation.w2s is not None
+        master_config.on_policy_distillation.w2s.vocab_size = vocab_size
     if opd_full_config is not None:
         # model_dump() is typed dict[str, Any], so the envelope is assembled here
         # and cast: OnPolicyDistillationFullConfig stays the single source of the
@@ -2085,7 +2145,20 @@ def setup_single_controller(
             teacher.setup_data_plane(dp_config)
         # Only reachable now: create_teacher_worker_groups above materializes the
         # teacher's Megatron checkpoint, so the LM head cannot be read earlier.
-        if (
+        if isinstance(opd_full_config, opd_module.W2SOPDConfig):
+            assert master_config.on_policy_distillation is not None
+            _load_w2s_teacher_lm_heads(
+                trainer,
+                teacher_worker_groups,
+                alias_to_group_alias,
+                positive_alias=next(
+                    iter(
+                        master_config.on_policy_distillation.teacher_model_by_agent_name
+                    )
+                ),
+                transport=opd_full_config.transport,
+            )
+        elif (
             opd_full_config is not None
             and opd_full_config.teacher_payload == "hidden_states"
         ):
@@ -2169,7 +2242,7 @@ def setup_single_controller(
     advantage_estimator = _build_advantage_estimator(master_config)
     loss_fn = ClippedPGLossFn(
         master_config.loss_fn,
-        opd_full=opd_module.get_opd_full_config(master_config),
+        opd_full=opd_module.get_opd_distribution_config(master_config),
     )
     _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (

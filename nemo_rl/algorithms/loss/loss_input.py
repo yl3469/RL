@@ -28,6 +28,10 @@ from nemo_rl.algorithms.loss.utils import (
     map_teacher_logits_to_draft_vocab,
     reconstruct_opd_full_teacher_logits,
 )
+from nemo_rl.algorithms.w2s_opd import (
+    w2s_reverse_kl_from_hidden,
+    w2s_reverse_kl_from_support,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     prepare_xtoken_cross_tokenizer_loss_input,
 )
@@ -48,6 +52,8 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
+
+    from nemo_rl.algorithms.opd import W2SOPDConfig
 
 
 def _prepare_opd_full_loss_input(
@@ -90,6 +96,7 @@ def _prepare_opd_full_loss_input(
     # Deferred: nemo_rl.algorithms.opd imports the data plane (tensordict), which
     # should not be pulled into every loss-function consumer.
     from nemo_rl.algorithms.opd import (
+        W2SOPDConfig,
         opd_full_payload_field,
         opd_full_teacher_index_field,
     )
@@ -99,6 +106,16 @@ def _prepare_opd_full_loss_input(
         raise NotImplementedError(
             "opd_full currently requires the Megatron vocabulary-parallel path; "
             "the Automodel-only logit path is not supported."
+        )
+
+    if isinstance(full_cfg, W2SOPDConfig):
+        return _prepare_w2s_opd_loss_input(
+            logits,
+            data,
+            full_cfg,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            teacher_output_layer_weight_by_index=teacher_output_layer_weight_by_index,
         )
 
     payload_field = opd_full_payload_field(full_cfg)
@@ -135,7 +152,7 @@ def _prepare_opd_full_loss_input(
     )
     entropy = None
     cross_entropy = None
-    if full_cfg.validate_decomposition:
+    if full_cfg.validate_decomposition or full_cfg.log_student_entropy:
         # inference_only: both are read detached for metrics only, so there is no
         # reason to save their inputs for a backward that never runs.
         entropy = ChunkedDistributedEntropy.apply(  # type: ignore[misc]
@@ -144,6 +161,7 @@ def _prepare_opd_full_loss_input(
             vocab_parallel_group,
             True,
         )
+    if full_cfg.validate_decomposition:
         cross_entropy = ChunkedDistributedCrossEntropyToFixedLogits.apply(  # type: ignore[misc]
             logits,
             teacher_logits,
@@ -193,6 +211,135 @@ def _prepare_opd_full_loss_input(
             sampling_params=None,
             chunk_size=chunk_size,
         )
+    return loss_input
+
+
+def _student_sum_p_log_p(
+    logits: torch.Tensor,
+    chunk_size: int,
+    vocab_parallel_group: torch.distributed.ProcessGroup,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Per-position ``sum_v p_s log p_s`` of the student, full sequence on every CP rank.
+
+    Metrics only: computed without autograd, so it can never join the loss graph
+    and keeps no logits alive for a backward.
+    """
+    with torch.no_grad():
+        entropy = ChunkedDistributedEntropy.apply(  # type: ignore[misc]
+            logits,
+            chunk_size,
+            vocab_parallel_group,
+            True,
+        )
+    if context_parallel_group is not None and (
+        torch.distributed.get_world_size(context_parallel_group) > 1
+    ):
+        entropy = allgather_cp_sharded_tensor(
+            entropy, context_parallel_group, seq_dim=1
+        )
+    return entropy
+
+
+def _prepare_w2s_opd_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    w2s_cfg: "W2SOPDConfig",
+    *,
+    vocab_parallel_group: torch.distributed.ProcessGroup,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+    teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]],
+) -> dict[str, Any]:
+    """Build the W2S-OPD loss input: the reverse KL to the frozen proxy.
+
+    Args:
+        logits: Student vocabulary-parallel logits ``[B, S_local, V_local]``.
+        data: Microbatch carrying the transport's columns.
+        w2s_cfg: The resolved W2S-OPD config.
+        vocab_parallel_group: Vocabulary-parallel process group.
+        context_parallel_group: Context-parallel process group.
+        teacher_output_layer_weight_by_index: The anchor, positive, and
+            negative LM-head shards under keys 0, 1, 2; read only by the
+            ``hidden_states`` transport.
+
+    Returns:
+        Loss input dict with the per-token divergence ``[B, S - 1]`` and, with
+        ``log_student_entropy``, the student's ``sum_v p log p``.
+
+    Raises:
+        ValueError: If a transport column, a frozen LM head, or the verified
+            vocabulary size is missing.
+    """
+    # Deferred: the data-plane package imports tensordict, which should not be
+    # pulled into every loss-function consumer.
+    from nemo_rl.data_plane.schema import (
+        W2S_COMPONENT_FIELDS,
+        W2S_PROXY_FIELDS,
+        W2S_PROXY_SUPPORT_IDS_FIELD,
+        W2S_PROXY_TARGET_LOGPROBS_FIELD,
+    )
+
+    chunk_size = w2s_cfg.chunk_size
+    assert chunk_size is not None  # W2SOPDConfig rejects a null chunk_size
+    if w2s_cfg.transport == "proxy_support":
+        missing = [field for field in W2S_PROXY_FIELDS if field not in data]
+        if missing:
+            raise ValueError(
+                f"W2S-OPD requires the proxy columns {missing!r} in the training "
+                "microbatch."
+            )
+        divergence = w2s_reverse_kl_from_support(
+            logits,
+            data[W2S_PROXY_SUPPORT_IDS_FIELD],
+            data[W2S_PROXY_TARGET_LOGPROBS_FIELD],
+            chunk_size=chunk_size,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+    else:
+        heads = teacher_output_layer_weight_by_index or {}
+        if sorted(heads) != [0, 1, 2]:
+            raise ValueError(
+                "W2S-OPD's hidden_states transport needs the anchor, positive, "
+                "and negative LM heads on the student; see "
+                "load_w2s_teacher_lm_heads."
+            )
+        if w2s_cfg.vocab_size is None:
+            raise ValueError("W2S-OPD requires the verified tokenizer vocabulary size.")
+        missing = [field for field in W2S_COMPONENT_FIELDS if field not in data]
+        if missing:
+            raise ValueError(
+                f"W2S-OPD requires the frozen arm columns {missing!r} in the "
+                "training microbatch."
+            )
+        divergence = w2s_reverse_kl_from_hidden(
+            logits,
+            (
+                data[W2S_COMPONENT_FIELDS[0]],
+                data[W2S_COMPONENT_FIELDS[1]],
+                data[W2S_COMPONENT_FIELDS[2]],
+            ),
+            (heads[0], heads[1], heads[2]),
+            alpha=w2s_cfg.alpha,
+            top_k=w2s_cfg.top_k,
+            vocab_size=w2s_cfg.vocab_size,
+            chunk_size=chunk_size,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+    # Position t predicts token t+1, the LOGPROB convention that pairs with
+    # token_mask[:, 1:].
+    next_token_width = int(data["input_ids"].shape[1]) - 1
+    loss_input: dict[str, Any] = {
+        "opd_full_divergence": divergence[:, :next_token_width]
+    }
+    if w2s_cfg.log_student_entropy:
+        loss_input["opd_full_entropy"] = _student_sum_p_log_p(
+            logits,
+            chunk_size,
+            vocab_parallel_group,
+            context_parallel_group,
+        )[:, :next_token_width]
     return loss_input
 
 
