@@ -329,7 +329,7 @@ def _captured_result(harness, owner, count):
     ids = tuple(identity for chunk in chunks for identity in chunk["ids"])
     return (
         dict(
-            rollout_id=owner,
+            capture_key=owner,
             manifest=[record.model_dump() for record in manifest.records],
             terminal_model_call_id=manifest.records[-1].model_call_id,
             terminal_selection="declared",

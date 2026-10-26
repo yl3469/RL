@@ -2241,7 +2241,7 @@ class TestDataPlaneCheckpoint:
         if damage == "missing_key":
             keys.pop(0)
         if damage == "failed_without_row":
-            keys.remove(f"{attempt['receipt']['rollout_id']}/failed")
+            keys.remove(f"{attempt['receipt']['capture_key']}/failed")
         dp = _StagingInventoryDPClient(keys, partition_id=_STAGING_PARTITION_ID)
         actor = _ACTOR_CLS(
             config,
