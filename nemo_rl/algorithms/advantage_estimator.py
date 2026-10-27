@@ -43,7 +43,7 @@ import math
 from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -75,6 +75,15 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     # OPD specific: subtract the mean advantage over every valid token in the
     # batch the estimator sees (a whole step; see OPDAdvantageEstimator).
     subtract_global_baseline: bool = False
+
+    @model_validator(mode="after")
+    def validate_full_group_std(self) -> "AdvEstimatorConfig":
+        """Reject full_group_std for estimators that would ignore it."""
+        if self.full_group_std and self.name != "grpo":
+            raise ValueError(
+                f"adv_estimator.full_group_std is only supported for name='grpo', got {self.name!r}."
+            )
+        return self
 
 
 class GAEConfig(BaseModel, extra="allow"):

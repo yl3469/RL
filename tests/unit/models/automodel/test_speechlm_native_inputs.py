@@ -23,6 +23,8 @@ import torch.nn.functional as F
 pytest.importorskip("nemo.collections.speechlm2")
 pytest.importorskip("nemo_automodel.components.utils.model_utils")
 
+pytestmark = pytest.mark.automodel
+
 from lightning import LightningModule  # noqa: E402
 from nemo_automodel.components.models.common import BackendConfig  # noqa: E402
 from nemo_automodel.components.models.nemotron_v3.model import (  # noqa: E402

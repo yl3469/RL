@@ -14,7 +14,7 @@
 
 """Single-turn CPU transcript reward environment."""
 
-from typing import Any
+from typing import Annotated, Any
 
 import ray
 import torch
@@ -28,7 +28,7 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 
 class ASREnvConfig(BaseModel):
-    num_workers: int = Field(default=1, ge=1)
+    num_workers: Annotated[int, Field(ge=1)] = 1
 
 
 @ray.remote

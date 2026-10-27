@@ -26,6 +26,8 @@ from transformers import AutoConfig, NemotronHConfig
 pytest.importorskip("nemo.collections.speechlm2")
 pytest.importorskip("nemo_automodel.components.utils.model_utils")
 
+pytestmark = pytest.mark.automodel
+
 from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel  # noqa: E402
 
 from nemo_rl.models.automodel.speechlm import SpeechLMPolicy  # noqa: E402

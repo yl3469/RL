@@ -29,6 +29,7 @@ replace-imports-with-any = [
 project-includes = [
   "nemo_rl/models/policy/workers/speechlm_policy_worker.py",
   "nemo_rl/data/asr.py",
+  "nemo_rl/environments/asr_environment.py",
   "nemo_rl/environments/asr_reward.py",
   "nemo_rl/models/automodel/refit.py",
   "nemo_rl/models/automodel/speechlm.py",

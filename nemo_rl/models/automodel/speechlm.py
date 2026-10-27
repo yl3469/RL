@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import torch
 from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel
@@ -33,9 +33,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.models.automodel.speechlm_logprobs import response_logprobs
-
-if TYPE_CHECKING:
-    from nemo_rl.models.policy import SpeechLMNativeConfig
+from nemo_rl.models.policy import SpeechLMNativeConfig
 
 
 class SpeechLMPolicy(SALMAutomodel):
@@ -47,10 +45,6 @@ class SpeechLMPolicy(SALMAutomodel):
         *,
         native_model: SpeechLMNativeConfig | dict[str, Any],
     ) -> None:
-        from nemo_rl.models.policy import (
-            SpeechLMNativeConfig,
-        )  # Avoid a policy import cycle.
-
         self.native_model: dict[str, Any] = SpeechLMNativeConfig.model_validate(
             native_model
         ).model_dump()
@@ -106,10 +100,6 @@ class SpeechLMPolicy(SALMAutomodel):
         for name in ("use_liger_kernel", "force_hf"):
             if kwargs.pop(name, False):
                 raise ValueError(f"{name} is not supported for native SpeechLM")
-        from nemo_rl.models.policy import (
-            SpeechLMNativeConfig,
-        )  # Optional Speech policy configuration.
-
         native_config = SpeechLMNativeConfig.model_validate(native_model).model_dump()
         # FP32 loader storage protects trainable checkpoint values. FSDP's BF16
         # compute policy reduces frozen storage before materialization.
