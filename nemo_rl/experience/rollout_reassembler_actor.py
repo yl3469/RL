@@ -54,8 +54,10 @@ class ReassemblyRequest:
     loss_multiplier: float = 1.0
     reward_checks: tuple[RewardChecks | None, ...] | None = None
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
-    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    # Real agent identity for flat rows, retained for existing checkpoint readers.
     resolved_agent_name: Optional[str] = None
+    # Taskset or flat-agent attribution, persisted with sealed receipts.
+    attribution_key: Optional[str] = None
 
 
 @dataclass(frozen=True)

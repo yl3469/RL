@@ -193,6 +193,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "mask_sample",
         "loss_multiplier",
         "resolved_agent_name",
+        "attribution_key",
         "reward_checks",
         "reward_log_contexts",
     }
