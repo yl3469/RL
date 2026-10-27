@@ -201,6 +201,13 @@ class W2SOPDConfig(OnPolicyDistillationFullConfig):
     # Sequence chunk bounding the fp32 proxy and student-logit working set;
     # required here (null is rejected below).
     chunk_size: Optional[int] = 128
+    # Report how closely the student's own ranking follows the proxy support,
+    # averaged over trained tokens: w2s_opd_proxy_top1_agreement (the student's
+    # argmax is the proxy's) and w2s_opd_proxy_topk_overlap (the share of the
+    # student's top-K inside the support, with K = top_k). One extra chunked,
+    # no-grad top-K pass over the student logits; diagnostics only. Reads the
+    # support column, so it needs transport: proxy_support.
+    log_proxy_agreement: bool = False
 
     @model_validator(mode="after")
     def validate_w2s_settings(self) -> "W2SOPDConfig":
@@ -222,6 +229,12 @@ class W2SOPDConfig(OnPolicyDistillationFullConfig):
             )
         if self.chunk_size is None:
             raise ValueError("on_policy_distillation.w2s requires a chunk_size.")
+        if self.log_proxy_agreement and self.transport != "proxy_support":
+            raise ValueError(
+                "on_policy_distillation.w2s.log_proxy_agreement reads the proxy "
+                "support column, so it requires transport 'proxy_support', got "
+                f"{self.transport!r}."
+            )
         return self
 
 

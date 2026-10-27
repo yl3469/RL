@@ -719,6 +719,7 @@ class OnPolicyDistillationFullTransport(TypedDict):
     top_k: NotRequired[int]
     vocab_size: NotRequired[int | None]
     transport: NotRequired[Literal["proxy_support", "hidden_states"]]
+    log_proxy_agreement: NotRequired[bool]
 
 
 class PolicyConfig(TypedDict):

@@ -319,6 +319,7 @@ on_policy_distillation:
     payload_dtype: bfloat16
     teacher_lm_head_lifecycle: offload  # none | offload
     log_student_entropy: false
+    log_proxy_agreement: false
 ```
 
 Each reference becomes a frozen `ref:<alias>` teacher and the anchor an
@@ -343,6 +344,17 @@ diagnostics computed from the generation and training log-probabilities:
 `w2s_opd_sampling_importance_ratio`, `w2s_opd_seq_mean_log_ratio_abs`, and
 `w2s_opd_seq_sum_log_ratio_abs`. None of the three enters the loss.
 
+`log_proxy_agreement` reports how closely the student's own ranking follows
+the proxy, averaged over trained tokens: `w2s_opd_proxy_top1_agreement`, the
+share of tokens whose student argmax is the proxy's argmax, and
+`w2s_opd_proxy_topk_overlap`, `|top-K(student) ∩ S_t| / K` with `K = top_k`.
+Padded vocabulary ids never enter the student's top-K. The loss renormalizes on
+`S_t`, so it never sees where the student puts the rest of its mass; these
+metrics show how far the student's own top-K is from the support it is
+trained on. The diagnostic costs one extra chunked no-grad top-K pass over the
+student logits. It reads the support column, so it needs
+`transport: proxy_support`.
+
 ### W2S-OPD restrictions
 
 On top of the full-vocabulary loss restrictions above (Megatron, the
@@ -363,6 +375,7 @@ rejected rather than silently ignored:
   to the student's initialization.
 - `transport: proxy_support` needs `policy.sequence_packing.enabled: true` and a
   negative teacher with `pipeline_model_parallel_size: 1`.
+- `log_proxy_agreement: true` needs `transport: proxy_support`.
 - Under the `ready_first` sampler, set `grpo.seq_logprob_error_threshold`
   instead of `use_importance_sampling_correction`: there is no sampled-token
   term to reweight, so rollouts whose generation and training log-probabilities

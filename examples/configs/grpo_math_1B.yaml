@@ -759,4 +759,6 @@ data_plane:
 #     payload_dtype: bfloat16       # dtype of the shipped hidden states
 #     teacher_lm_head_lifecycle: offload  # offload or none
 #     log_student_entropy: false    # also report the student's full-vocab entropy
+#     log_proxy_agreement: false    # also report student-vs-proxy top-1 agreement and
+#                                   # top-K overlap (K = top_k); proxy_support only
 on_policy_distillation: null
