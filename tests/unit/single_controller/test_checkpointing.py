@@ -61,6 +61,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointMetadata,
     DataPlaneMutationCut,
     TQReplayBuffer,
+    validate_forest_checkpoint_metadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -538,6 +539,8 @@ class _RefitRecordingTrainer(_FakeTrainer):
 
 
 class _FakeRolloutManager:
+    execution_row_multiple = 1
+
     def __init__(self, events: Optional[list[str]] = None) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
@@ -900,6 +903,115 @@ def _data_plane_checkpoint_metadata(
         "replay_manifest_digest": manifest_digest,
         "replay_group_count": group_count,
     }
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("saved_mode", "current_mode", "saved_multiple", "error"),
+    [
+        (True, False, 8, "forest_training mismatch: saved=True, current=False"),
+        (False, True, None, "forest_training mismatch: saved=False, current=True"),
+        (True, True, 8, "forest execution padding mismatch: saved=8, current=4"),
+    ],
+)
+def test_replay_compatibility_is_checked_without_unfinished_groups(
+    tmp_path: Path,
+    capture_enabled: bool,
+    saved_mode: bool,
+    current_mode: bool,
+    saved_multiple: int | None,
+    error: str,
+) -> None:
+    """Finished replay groups must not bypass validation through an empty ledger."""
+    config = _actor_master_config(tmp_path, token_capture_enabled=capture_enabled)
+    config.token_capture.forest_training = current_mode
+    metadata = _data_plane_checkpoint_metadata(group_count=1)
+    metadata.update(
+        rollout_recovery_schema_version=4,
+        forest_training=saved_mode,
+        forest_execution_row_multiple=saved_multiple,
+    )
+    torch.save({"groups": []}, tmp_path / REPLAY_BUFFER_METADATA_FILENAME)
+    actor = _ACTOR_CLS(
+        config,
+        _make_actor_args(
+            last_checkpoint_path=str(tmp_path), data_plane_checkpoint_metadata=metadata
+        ),
+        SetupTimingMetrics(),
+    )
+    actor._rollout_manager.execution_row_multiple = 4
+    actor._buffer.load_state_dict = AsyncMock()
+    try:
+        assert actor._rollout_recovery_ledger.groups() == []
+        with pytest.raises(ValueError, match=error):
+            asyncio.run(actor._maybe_restore_replay_buffer())
+        actor._buffer.load_state_dict.assert_not_awaited()
+        assert actor._dp_client.clear_calls == []
+    finally:
+        actor._checkpointer.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("metadata", "mode", "multiple", "error"),
+    [
+        ({"rollout_recovery_schema_version": 3}, False, None, None),
+        ({"rollout_recovery_schema_version": 3}, True, 4, "checkpoint has schema 3"),
+        (
+            {"rollout_recovery_schema_version": 4},
+            False,
+            None,
+            "missing forest_training",
+        ),
+        ({"rollout_recovery_schema_version": 4}, True, 4, "missing forest_training"),
+        (
+            {"forest_training": False, "forest_execution_row_multiple": None},
+            False,
+            None,
+            None,
+        ),
+        ({"forest_training": True, "forest_execution_row_multiple": 4}, True, 4, None),
+        (
+            {"forest_training": 1, "forest_execution_row_multiple": 4},
+            True,
+            4,
+            "forest_training mismatch",
+        ),
+        ({"forest_training": True}, True, 4, "padding mismatch"),
+        (
+            {"forest_training": True, "forest_execution_row_multiple": True},
+            True,
+            1,
+            "padding mismatch",
+        ),
+        (
+            {"forest_training": True, "forest_execution_row_multiple": 0},
+            True,
+            4,
+            "padding mismatch",
+        ),
+        (
+            {"forest_training": False, "forest_execution_row_multiple": 4},
+            False,
+            None,
+            "padding mismatch",
+        ),
+    ],
+)
+def test_forest_checkpoint_metadata_compatibility(
+    metadata: DataPlaneCheckpointMetadata,
+    mode: bool,
+    multiple: int | None,
+    error: str | None,
+) -> None:
+    if error is None:
+        validate_forest_checkpoint_metadata(
+            metadata, forest_training=mode, execution_row_multiple=multiple
+        )
+    else:
+        with pytest.raises(ValueError, match=error):
+            validate_forest_checkpoint_metadata(
+                metadata, forest_training=mode, execution_row_multiple=multiple
+            )
 
 
 def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
@@ -1536,6 +1648,11 @@ class TestPeriodicRolloutCheckpoint:
         metadata = json.loads((snapshot / "data_plane" / "metadata.json").read_text())[
             "user_metadata"
         ]
+        assert metadata["forest_training"] is True
+        assert (
+            metadata["forest_execution_row_multiple"]
+            == actor._rollout_manager.execution_row_multiple
+        )
         restored = TQReplayBuffer(
             actor._dp_client,
             _PARTITION_ID,
@@ -2249,6 +2366,8 @@ class TestDataPlaneCheckpoint:
                 dp_client=dp,
                 last_checkpoint_path=str(tmp_path),
                 data_plane_checkpoint_metadata={
+                    "forest_training": True,
+                    "forest_execution_row_multiple": 1,
                     "rollout_recovery_schema_version": (
                         2
                         if damage == "schema"
@@ -2268,7 +2387,14 @@ class TestDataPlaneCheckpoint:
         actor._dataloader = SimpleNamespace(dataset={7: {"idx": 7}})
         try:
             if damage not in {None, "failed_without_row"}:
-                with pytest.raises((ValueError, RuntimeError)):
+                expected_error = {
+                    "missing_key": "staging rows missing from live TQ state",
+                    "missing_selection": "sealed receipt staging manifest mismatch",
+                    "mode": "forest_training mismatch: saved=True, current=False",
+                    "schema": "rollout recovery schema mismatch",
+                    "obsolete_empty": "checkpoint has schema 3",
+                }[damage]
+                with pytest.raises((ValueError, RuntimeError), match=expected_error):
                     asyncio.run(
                         actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
                     )
@@ -2287,7 +2413,8 @@ class TestDataPlaneCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
-    def test_metadata_uses_explicit_snapshot_identity(self, tmp_path):
+    @pytest.mark.parametrize("forest_training", [False, True])
+    def test_metadata_uses_explicit_snapshot_identity(self, tmp_path, forest_training):
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=1,
@@ -2298,6 +2425,7 @@ class TestDataPlaneCheckpoint:
         save_state.trainer_version = 7
         save_state.current_epoch = 2
         dp_client = _FakeDPClient()
+        mc.token_capture.forest_training = forest_training
 
         async def _main() -> None:
             actor = _ACTOR_CLS(
@@ -2309,6 +2437,7 @@ class TestDataPlaneCheckpoint:
             # mutable controller fields after checkpoint I/O has started.
             actor._trainer_version = 11
             actor._current_epoch = 5
+            actor._rollout_manager.execution_row_multiple = 4
             await actor._save_data_plane_checkpoint(
                 str(tmp_path / "tmp_step_3"),
                 train_steps=3,
@@ -2323,6 +2452,10 @@ class TestDataPlaneCheckpoint:
         assert metadata["single_controller_train_steps"] == 3
         assert metadata["single_controller_trainer_version"] == 7
         assert metadata["single_controller_epoch"] == 2
+        assert metadata["forest_training"] is forest_training
+        assert metadata["forest_execution_row_multiple"] == (
+            4 if forest_training else None
+        )
 
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
         self, tmp_path

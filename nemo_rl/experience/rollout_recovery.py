@@ -326,7 +326,8 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     pending = set(receipt.get("pending_call_ids", []))
     if pending and not receipt.get("capture_poisoned"):
         raise UnresolvedCaptureAcknowledgement(
-            "Capture acknowledgement is unresolved; preserve staging until reconciliation"
+            "Capture acknowledgement is unresolved; preserve staging until reconciliation: "
+            f"capture_key={receipt.get('capture_key')!r}, pending_calls={len(pending)}"
         )
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
@@ -365,15 +366,22 @@ def _attempt_staging_keys(
 ) -> list[str]:
     """Prove cleanup custody now; leave selection/chain proofs to the finalizer."""
     if receipt is not None and receipt.get("capture_key") != gate_id:
-        raise ValueError("sealed receipt identity mismatch")
+        raise ValueError(
+            "sealed receipt identity mismatch: "
+            f"expected {gate_id!r}, receipt has {receipt.get('capture_key')!r}"
+        )
     keys = _receipt_staging_keys(receipt)
     if selection is not None:
         # Round-trip validation also rejects tensor or malformed selection metadata.
         _selection_from_state(dataclasses.asdict(selection))
         if receipt is None:
-            raise ValueError("Forest recovery requires an ordinary capture receipt")
+            raise ValueError(
+                f"Forest recovery requires an ordinary capture receipt: {gate_id=}"
+            )
         if not selection.response_ids and not receipt.get("capture_poisoned"):
-            raise ValueError("Empty Forest selection requires poisoned capture")
+            raise ValueError(
+                f"Empty Forest selection requires poisoned capture: {gate_id=}"
+            )
         for entry in receipt["manifest"]:
             call_id = entry.get("model_call_id")
             if (
@@ -382,10 +390,15 @@ def _attempt_staging_keys(
                 or "/" in call_id
                 or entry["staging_key"] != f"{gate_id}/{call_id}"
             ):
-                raise ValueError("Forest recovery has foreign staging ownership")
+                raise ValueError(
+                    "Forest recovery has foreign staging ownership: "
+                    f"{gate_id=}, staging_key={entry['staging_key']!r}"
+                )
         manifest_keys = [entry["staging_key"] for entry in receipt["manifest"]]
         if len(manifest_keys) != len(set(manifest_keys)):
-            raise ValueError("Forest recovery has duplicate staging ownership")
+            raise ValueError(
+                f"Forest recovery has duplicate staging ownership: {gate_id=}"
+            )
     return keys
 
 
@@ -399,11 +412,12 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
         RolloutSelection,
     )
 
-    if not isinstance(raw, dict) or set(raw) != {
-        field.name for field in dataclasses.fields(RolloutSelection)
-    }:
+    expected_fields = {field.name for field in dataclasses.fields(RolloutSelection)}
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise ValueError(
-            "Forest recovery selection must contain every descriptor field"
+            "Forest recovery selection must contain every descriptor field: "
+            f"expected={sorted(expected_fields)}, "
+            f"found={sorted(map(str, raw)) if isinstance(raw, dict) else type(raw).__name__}"
         )
     responses, flags = raw["response_ids"], raw["action_flags"]
     if (
@@ -424,11 +438,11 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
         raise ValueError(
             "Forest recovery selection has invalid response IDs or action flags"
         )
-    return RolloutSelection(
-        response_ids=responses,
-        action_flags=tuple(ActionOutputFlags(**flag) for flag in flags),
-        truncated=raw["truncated"],
-    )
+    selection_state: dict[str, Any] = {
+        **raw,
+        "action_flags": tuple(ActionOutputFlags(**flag) for flag in flags),
+    }
+    return RolloutSelection(**selection_state)
 
 
 class RolloutRecoveryLedger:
@@ -1240,7 +1254,9 @@ class RolloutRecoveryLedger:
                     ) from error
                 receipt = attempt_state.get("receipt")
                 if schema_version >= 4 and "logical_selection" not in attempt_state:
-                    raise ValueError("recovery attempt is missing logical_selection")
+                    raise ValueError(
+                        f"recovery attempt is missing logical_selection: {gate_id=}"
+                    )
                 selection = _selection_from_state(
                     attempt_state.get("logical_selection")
                 )

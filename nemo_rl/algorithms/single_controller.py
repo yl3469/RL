@@ -88,6 +88,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
     TQReplayGroupMetadata,
     TQReplayMetadataState,
+    validate_forest_checkpoint_metadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
@@ -188,7 +189,6 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_STATE_FILENAME,
     SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
-    RolloutAttemptStatus,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -1036,6 +1036,19 @@ class SingleControllerActor:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
+    def _validate_forest_checkpoint_metadata(self) -> None:
+        """Validate checkpoint row semantics before replay or custody changes."""
+        if self._data_plane_checkpoint_metadata is not None:
+            validate_forest_checkpoint_metadata(
+                self._data_plane_checkpoint_metadata,
+                forest_training=self._master_config.token_capture.forest_training,
+                execution_row_multiple=(
+                    self._rollout_manager.execution_row_multiple
+                    if self._master_config.token_capture.forest_training
+                    else None
+                ),
+            )
+
     async def _maybe_restore_replay_buffer(self) -> int:
         """Restore the local replay index for the native TQ checkpoint.
 
@@ -1045,6 +1058,7 @@ class SingleControllerActor:
         """
         if self._last_checkpoint_path is None:
             return 0
+        self._validate_forest_checkpoint_metadata()
         metadata_path = os.path.join(
             self._last_checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME
         )
@@ -1153,6 +1167,7 @@ class SingleControllerActor:
         """Restore unfinished ownership for prioritized rollout-pump redispatch."""
         if self._last_checkpoint_path is None:
             return
+        self._validate_forest_checkpoint_metadata()
         recovery_path = Path(
             self._last_checkpoint_path,
             ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -1184,13 +1199,6 @@ class SingleControllerActor:
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
                 f"supported={sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
-            )
-        if (
-            expected_schema_version < 4
-            and self._master_config.token_capture.forest_training
-        ):
-            raise ValueError(
-                "Obsolete Forest snapshots are unsupported; start a fresh run"
             )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
@@ -1246,18 +1254,6 @@ class SingleControllerActor:
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
             recovery_ledger.assert_checkpoint_safe()
-            if self._master_config.token_capture.enabled:
-                for group in recovery_ledger.groups():
-                    for sibling in group.siblings:
-                        attempt = sibling.current_attempt
-                        if (
-                            attempt.status is RolloutAttemptStatus.SEALED
-                            and (attempt.logical_selection is not None)
-                            != self._master_config.token_capture.forest_training
-                        ):
-                            raise ValueError(
-                                "recovery selection disagrees with forest_training mode"
-                            )
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
                 saved_capacity=self._async_cfg.max_buffered_rollouts
@@ -1816,6 +1812,12 @@ class SingleControllerActor:
             "partition_id": self._partition_id,
             "sampler_name": self._async_cfg.sampler.name,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
+            "forest_training": self._master_config.token_capture.forest_training,
+            "forest_execution_row_multiple": (
+                self._rollout_manager.execution_row_multiple
+                if self._master_config.token_capture.forest_training
+                else None
+            ),
         }
         if replay_metadata is not None:
             metadata["replay_metadata_schema_version"] = (

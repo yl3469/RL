@@ -187,7 +187,7 @@ async_rl:
     min_step_batch_fraction: 1  # Optional floor; drop budgets must also permit losses.
 ```
 
-Checkpoint/resume and periodic rollout snapshots use the [shared SingleController recovery path](./single-controller.md#forest-recovery). The ledger persists selected-call metadata alongside attempt receipts and reward checks; it rebuilds unfinished groups and restores published rows with their logical owners and padding. Forest recovery requires schema 4.
+Checkpointing and rollout snapshots work as for any [Single-Controller run](./single-controller.md#checkpointing-and-replay-recovery). Forest recovery requires schema 4 with saved forest-mode and execution-padding metadata. Checkpoints from earlier experimental context-compaction builds without this metadata cannot be resumed; there is no migration. Resume rejects changes to forest mode or the execution row multiple used to pad saved groups.
 
 The learner must use non-interleaved Megatron with fixed batches or ordinary sequence packing (`policy.sequence_packing.enabled: true`). Fixed-batch train and logprob microbatch sizes must be positive integers; packed execution uses the existing token-budget bin planner. Dynamic batching remains unsupported. Setup checks the actual loaded model before any rollout runs: dense models pass; MoE models must use supported dropless per-token routing without auxiliary losses or capacity limits. Router-bias updates are allowed, but execution-padding and borrowed inputs can still contribute to expert-load counts and affect subsequent bias updates. Artificial-input exclusion is tracked separately in [#4519](https://github.com/NVIDIA-NeMo/RL/pull/4519); it is not included here. Model-specific router-mask restrictions still apply.
 
