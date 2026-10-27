@@ -83,6 +83,7 @@ def test_native_worker_keeps_compact_response_and_logprob_positions(
         "vllm_cfg": {"native_speechlm": native_speechlm, "max_model_len": 128},
     }
     worker._build_sampling_params = lambda **kwargs: None
+    worker._native_lora_request = None
     tokenizer = SimpleNamespace(bos_token=None, get_vocab=lambda: {"<|audio|>": 7})
     worker.llm = SimpleNamespace(
         generate=lambda *args, **kwargs: [response],
