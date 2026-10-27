@@ -141,6 +141,7 @@ def test_speechlm_recipe_logs_typed_config_to_tensorboard(tmp_path, monkeypatch)
         logger.finish()
 
 
+@pytest.mark.automodel
 def test_speechlm_recipe_uses_native_checkpoint_config(tmp_path, monkeypatch):
     from omegaconf import OmegaConf
 

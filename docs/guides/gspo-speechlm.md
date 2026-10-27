@@ -8,9 +8,9 @@ source checkouts and independently prepared policy and generation environments.
 
 This recipe trains a SpeechLM from its full Hugging Face seed directory using
 fractional WER/CER rewards and sequence-level GSPO. The native policy preserves
-its audio encoder, frozen MTP head and checkpoint names. An explicit parameter
-surface keeps selected optimizer masters in FP32 while frozen weights stay in
-their declared storage dtype. Generation loads the seed before applying selected
+its audio encoder, any native MTP head (kept frozen) and checkpoint names. An
+explicit parameter surface keeps selected optimizer masters in FP32; frozen
+storage follows the precision policy described below. Generation loads the seed before applying selected
 weight refits, so frozen weights are never replaced by dummy initialization.
 
 ## Requirements
@@ -167,7 +167,7 @@ Its inherited defaults and overrides resolve the following settings:
 | Responses per recording | 64; temperature 0.8 |
 | Learning rate | 1e-6 after a 5-update linear warmup from 0.1 of the target LR |
 | Update surface | 269 named tensors, 1,074,318,400 scalars; FP32 storage |
-| Frozen components | Remaining backbone/perception weights, MTP, and optional CTC head |
+| Frozen components | Remaining backbone/perception weights, optional MTP and CTC heads |
 | Training / generation parallelism | Policy TP=CP=1, EP=8; generation TP=8, EP=8 |
 | Context / global output limits | 62,464 / 17,278 tokens, further bounded by per-row caps and remaining context |
 | Checkpoint cadence / retention | Every 20 updates / 20 native checkpoints |
@@ -195,7 +195,7 @@ leave-one-out mean and **full valid-group sample standard deviation**, with
 Native SpeechLM requires unpacked sequences, policy TP=CP=1 and synchronous
 MTP-off generation. Router projection caching remains enabled during activation
 checkpoint recomputation; auxiliary MTP computation is disabled without deleting
-its frozen checkpoint state.
+any frozen MTP checkpoint state.
 
 When auditing retained rows in `train_data_step*.jsonl`, use `filtered_rewards`.
 With dynamic sampling enabled, raw `rewards` contains the unfiltered batch and
@@ -204,8 +204,9 @@ is not aligned with retained `source_idx` or content.
 The recipe saves every 20 updates. Reusing its output directory restores the
 latest finalized native optimizer, scheduler and dataloader state. Use a fresh
 output directory for an independent run. For the separate 20-plus-fresh-2
-qualification, run the [nightly shell driver](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh); it verifies saved state
-before and after restarting the training process.
+qualification, manually run the [shell driver](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh); it verifies saved state
+before and after restarting the training process. It needs 4 nodes of 8 GPUs and
+is excluded from the nightly suite.
 
 ## Export and evaluate
 
@@ -275,5 +276,5 @@ not post-RL timestamp accuracy.
 The main-based contribution has focused CPU tests for rewards, group statistics,
 audio transport, native input expansion/logprobs, precision selection, checkpoint
 loading, refits and export. Earlier distributed campaigns used separate immutable source/package pins.
-They do not qualify a fresh current-main distributed CUDA/EP installation. GPU CI and the normal nightly
-20-plus-fresh-2 test remain required for that environment.
+They do not qualify a fresh current-main distributed CUDA/EP installation. GPU CI and a manual
+20-plus-fresh-2 driver run remain required for that environment.
